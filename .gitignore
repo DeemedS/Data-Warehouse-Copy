@@ -485,3 +485,5 @@ $RECYCLE.BIN/
 
 # Ignore dev config
 appsettings.Development.json
+appsettings.Production.json
+appsettings.Staging.json

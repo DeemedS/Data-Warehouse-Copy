@@ -115,13 +115,17 @@ public static class TableCopyService
             // Select from source
             string selectSql = useTruncate || string.IsNullOrEmpty(dateColumn)
                 ? $"SELECT * FROM {sourceSchema}.{tableName}"
-                : $"SELECT * FROM {sourceSchema}.{tableName} WHERE CAST({dateColumn} AS DATE) BETWEEN @start_date AND @end_date";
+                : $"SELECT * FROM {sourceSchema}.{tableName} WHERE {dateColumn} BETWEEN @start_date AND @end_date";
 
             using var selectCmd = new SqlCommand(selectSql, sourceConn);
             if (!useTruncate && !string.IsNullOrEmpty(dateColumn))
             {
-                selectCmd.Parameters.AddWithValue("@start_date", start_date);
-                selectCmd.Parameters.AddWithValue("@end_date", end_date);
+                selectCmd.Parameters.AddWithValue("@start_date", DateTime.Parse(start_date).Date); // beginning of day
+                selectCmd.Parameters.AddWithValue("@end_date", DateTime.Parse(end_date).Date.AddDays(1).AddMilliseconds(-3)); // end of day 23:59:59.997
+
+                selectCmd.CommandTimeout = 0;
+
+                tableLogger.Information("Selecting rows from {Table} where {DateColumn} is between {StartDate} and {EndDate}", tableName, dateColumn, DateTime.Parse(start_date).Date, DateTime.Parse(end_date).Date.AddDays(1).AddMilliseconds(-3));
             }
 
             using var reader = selectCmd.ExecuteReader();
