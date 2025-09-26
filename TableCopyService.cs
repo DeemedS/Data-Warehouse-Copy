@@ -9,8 +9,9 @@ public static class TableCopyService
         string targetConnStr,
         string targetSchema,
         string sourceSchema,
-        string start_date, string
-        end_date, bool useTruncate,
+        string start_date,
+        string end_date,
+        bool useTruncate,
         string? dateColumn)
     {   
         var startTime = DateTime.Now;
@@ -54,9 +55,9 @@ public static class TableCopyService
 
             // Insert initial log row
             using (var logCmd = new SqlCommand(@"
-                INSERT INTO bronze.tbl_dw_copy_logs (TableName, StartTime, EndTime, StartDateParam, EndDateParam, Status)
+                INSERT INTO bronze.tbl_dw_copy_logs (TableName, StartTime, EndTime, StartDateParam, EndDateParam, DateColumn, UpdateDateColumn, PrimaryKey, Process, Status)
                 OUTPUT INSERTED.Id
-                VALUES (@TableName, @StartTime, @EndTime, @StartDateParam, @EndDateParam, @Status)", targetConn))
+                VALUES (@TableName, @StartTime, @EndTime, @StartDateParam, @EndDateParam, @DateColumn, @UpdateDateColumn, @PrimaryKey, @Process, @Status)", targetConn))
             {
                 logCmd.Parameters.AddWithValue("@TableName", tableName);
                 logCmd.Parameters.AddWithValue("@StartTime", startTime);
@@ -66,12 +67,20 @@ public static class TableCopyService
                 {
                     logCmd.Parameters.AddWithValue("@StartDateParam", DBNull.Value);
                     logCmd.Parameters.AddWithValue("@EndDateParam", DBNull.Value);
+                    logCmd.Parameters.AddWithValue("@DateColumn", DBNull.Value);
+                    logCmd.Parameters.AddWithValue("@Process", "Dim Copy");
                 }
                 else
                 {
+                    logCmd.Parameters.AddWithValue("@DateColumn", dateColumn);
                     logCmd.Parameters.AddWithValue("@StartDateParam", start_date);
                     logCmd.Parameters.AddWithValue("@EndDateParam", end_date);
+                    logCmd.Parameters.AddWithValue("@Process", "Fact Copy");
                 }
+                
+                logCmd.Parameters.AddWithValue("@UpdateDateColumn", DBNull.Value);
+                logCmd.Parameters.AddWithValue("@PrimaryKey", DBNull.Value);
+                
                 
                 logCmd.Parameters.AddWithValue("@Status", status);
                 logId = (int)logCmd.ExecuteScalar();
@@ -139,6 +148,17 @@ public static class TableCopyService
                 EnableStreaming = true,
                 NotifyAfter = 1
             };
+
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                string colName = reader.GetName(i);
+
+                if (!colName.Equals("Id", StringComparison.OrdinalIgnoreCase) &&
+                    !colName.Equals("insert_datetime", StringComparison.OrdinalIgnoreCase))
+                {
+                    bulkCopy.ColumnMappings.Add(colName, colName);
+                }
+            }
 
             int totalRows = 0;
             bulkCopy.SqlRowsCopied += (sender, e) =>
