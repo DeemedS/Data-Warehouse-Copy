@@ -56,12 +56,12 @@ public class BulkCopyManager
                     var now = DateTime.Now;
                     if (now.Hour == 0)
                     {
-                        dateFrom = now.AddDays(-1).ToString("yyyy-MM-dd");
+                        dateFrom = now.AddDays(-3).ToString("yyyy-MM-dd");
                         dateTo = now.AddDays(-1).ToString("yyyy-MM-dd");
                     }
                     else
                     {
-                        dateFrom = now.ToString("yyyy-MM-dd");
+                        dateFrom = now.AddDays(-1).ToString("yyyy-MM-dd");
                         dateTo = now.ToString("yyyy-MM-dd");
                     }
                     break;
@@ -97,11 +97,11 @@ public class BulkCopyManager
             .Where(t => !string.IsNullOrEmpty(t.TableName))
             .ToList();
 
-        var normalList = tables.Where(t => t.TableType == "fact" && t.UpdateDateColumn == null && t.PrimaryKey == null).ToList();
-        var copyUpdateList = tables.Where(t => t.TableType == "fact" && t.UpdateDateColumn != null && t.PrimaryKey != null).ToList();
+        var normalList = tables.Where(t => t.TableType == "fact" && string.IsNullOrEmpty(t.UpdateDateColumn) && string.IsNullOrEmpty(t.PrimaryKey)).ToList();
+        var copyUpdateList = tables.Where(t => t.TableType == "fact" && !string.IsNullOrEmpty(t.UpdateDateColumn) && !string.IsNullOrEmpty(t.PrimaryKey)).ToList();
         var truncateList = tables.Where(t => t.TableType == "dim").ToList();
         var storedProcList = tables.Where(t => t.TableType == "sproc").ToList();
-        var historicalList = tables.Where(t => t.TableType == "historical" && t.UpdateDateColumn != null).ToList();
+        var historicalList = tables.Where(t => t.TableType == "historical" && t.UpdateDateColumn != null && t.PrimaryKey != null).ToList();
 
 
         Log.Information("Starting bulk copy process...");
@@ -133,22 +133,24 @@ public class BulkCopyManager
             );
         }
 
-        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
-        foreach (var table in copyUpdateList)
+        Log.Information("Starting process for historical tables: {Tables}", string.Join(", ", historicalList.Select(t => t.TableName)));
+        foreach (var table in historicalList)
         {
-            TableCopyService.CopyTable(
+            TableCopyServiceWithVersioning.CopyTableWithVersioningFullIncremental(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,
                 targetSchema,
                 sourceSchema,
-                dateFrom!,
-                dateTo!,
-                false,
-                table.DateColumn
+                table.UpdateDateColumn!,
+                table.PrimaryKey!
             );
+        }
 
-            TableUpdateService.UpdateTable(
+        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
+        foreach (var table in copyUpdateList)
+        {
+            TableCopyServiceWithVersioning_v2.CopyTableWithVersioningFullIncremental_v2(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,

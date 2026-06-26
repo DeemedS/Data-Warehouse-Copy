@@ -122,7 +122,7 @@ public static class TableUpdateService
                     {
                         for (int j = 0; j < batch.Count; j++)
                             deleteCmd.Parameters.AddWithValue($"@pk{j}", batch[j]);
-
+                        deleteCmd.CommandTimeout = 0;
                         int deleted = deleteCmd.ExecuteNonQuery();
                         tableLogger.Information("Deleted {Count} rows in {Table} (batch {Batch})", deleted, tableName, i / batchSize + 1);
                     }
@@ -134,6 +134,7 @@ public static class TableUpdateService
                         WHERE {primaryKey} IN ({inClause})";
 
                     using var selectCmd = new SqlCommand(selectSql, sourceConn);
+                    selectCmd.CommandTimeout = 0;
                     for (int j = 0; j < batch.Count; j++)
                         selectCmd.Parameters.AddWithValue($"@pk{j}", batch[j]);
 
