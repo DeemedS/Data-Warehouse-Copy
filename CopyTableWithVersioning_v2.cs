@@ -80,6 +80,7 @@ public static class TableCopyServiceWithVersioning_v2
                 SELECT *
                 FROM {sourceSchema}.{tableName}
                 WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
+                OR {dateColumn} BETWEEN @StartDate AND @EndDate
             ", sourceConn);
 
             srcCmd.Parameters.AddWithValue("@StartDate",
@@ -98,6 +99,7 @@ public static class TableCopyServiceWithVersioning_v2
                 SELECT *
                 FROM {targetSchema}.{tableName}
                 WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
+                OR {dateColumn} BETWEEN @StartDate AND @EndDate
             ", targetConn);
 
             tgtCmd.CommandTimeout = 0;
