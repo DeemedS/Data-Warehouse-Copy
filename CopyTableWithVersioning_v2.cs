@@ -42,6 +42,8 @@ public static class TableCopyServiceWithVersioning_v2
 
         tableLogger.Information("Starting full incremental versioned copy for {Table}", tableName);
 
+        SqlTransaction? transaction = null;
+
         try
         {
             using var sourceConn = new SqlConnection(sourceConnStr);
@@ -93,18 +95,9 @@ public static class TableCopyServiceWithVersioning_v2
 
             // --- Step 2: Load active target data (valid_end IS NULL) ---
             var tgtCmd = new SqlCommand($@"
-                WITH Latest AS (
-                    SELECT *,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY {primaryKeyColumn}
-                            ORDER BY {updateDateColumn} DESC
-                        ) AS rn
-                    FROM {targetSchema}.{tableName}
-                    WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
-                )
                 SELECT *
-                FROM Latest
-                WHERE rn = 1
+                FROM {targetSchema}.{tableName}
+                WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
             ", targetConn);
 
             tgtCmd.CommandTimeout = 0;
@@ -148,56 +141,130 @@ public static class TableCopyServiceWithVersioning_v2
             if (identityColumns.Count > 0)
                 tableLogger.Information("Skipping identity columns: {Cols}", string.Join(", ", identityColumns));
 
-            using var transaction = targetConn.BeginTransaction();
+            transaction = targetConn.BeginTransaction();
+
+            var changedRows = tgtTable.Clone();
+            var newRows = tgtTable.Clone();
+            var newChangedRows = tgtTable.Clone();
 
             foreach (DataRow srcRow in srcTable.Rows)
             {
                 string pk = srcRow[primaryKeyColumn]?.ToString()?.Trim().ToLowerInvariant() ?? "";
                 bool isNewRecord = !targetLookup.ContainsKey(pk);
                 bool updateDateChanged = false;
+                DataRow? tgtRow = null;
+
                 tableLogger.Information("Processing record PK={PK}: IsNew={IsNew}", pk, isNewRecord);
 
                 if (!isNewRecord)
                 {
-                    var tgtRow = targetLookup[pk];
+                    tgtRow = targetLookup[pk];
 
                     DateTime srcUpdateDate = Convert.ToDateTime(srcRow[updateDateColumn ?? throw new ArgumentNullException(nameof(updateDateColumn))]);
                     DateTime tgtUpdateDate = Convert.ToDateTime(tgtRow[updateDateColumn ?? throw new ArgumentNullException(nameof(updateDateColumn))]);
 
                     tableLogger.Information("Comparing record PK={PK}: Source {SrcDate}, Target {TgtDate}", pk, srcUpdateDate, tgtUpdateDate);
 
-                    if (srcUpdateDate > tgtUpdateDate)
-                    {
-                        updateDateChanged = true;
-                    }
+                    updateDateChanged = srcUpdateDate != tgtUpdateDate;
                 }
 
-                if (isNewRecord || updateDateChanged)
+                if (updateDateChanged && tgtRow != null)
                 {
-                    // Build insert excluding identity columns
-                    var columnNames = srcTable.Columns.Cast<DataColumn>()
-                        .Where(c => !string.Equals(c.ColumnName, "id", StringComparison.OrdinalIgnoreCase))
-                        .Select(c => c.ColumnName)
-                        .ToList();
+                    changedRows.ImportRow(tgtRow);     // archive old version
+                    newChangedRows.ImportRow(srcRow);  // insert new version later
+                }
 
-                    var insertCols = string.Join(",", columnNames);
-                    var insertParams = string.Join(",", columnNames.Select(c => "@" + c));
+                if (isNewRecord)
+                {
+                    newRows.ImportRow(srcRow);
+                }
+    
+            }
 
-                    var insertCmd = new SqlCommand($@"
-                        INSERT INTO {targetSchema}.{tableName} ({insertCols})
-                        VALUES ({insertParams})", targetConn, transaction);
-                    insertCmd.CommandTimeout = 0;
+            // --- Step 4: Insert new rows ---
+            if (newRows.Rows.Count > 0)
+            {
+                using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
+                bulkCopy.DestinationTableName = $"{targetSchema}.{tableName}";
+                bulkCopy.BatchSize = 1000;
+                bulkCopy.BulkCopyTimeout = 0;
 
-                    foreach (var col in srcTable.Columns.Cast<DataColumn>())
+                foreach (DataColumn col in newRows.Columns)
+                {
+                    if (!identityColumns.Contains(col.ColumnName))
                     {
-                        if (string.Equals(col.ColumnName, "id", StringComparison.OrdinalIgnoreCase))
-                            continue;
+                        bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    }
+                }
 
-                        insertCmd.Parameters.AddWithValue("@" + col.ColumnName, srcRow[col] ?? DBNull.Value);
+                bulkCopy.WriteToServer(newRows);
+                recordsInserted += newRows.Rows.Count;
+
+                tableLogger.Information("Inserted {Count} new rows into target {Table}", newRows.Rows.Count, tableName);
+            }
+
+            // --- Step 5: Update changed rows ---
+            if (changedRows.Rows.Count > 0)
+            {
+                //Archive old rows to _history table
+                var historyTableName = $"{tableName}_history";
+                
+                using var bulkCopyHistory = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
+                bulkCopyHistory.DestinationTableName = $"{targetSchema}.{historyTableName}";
+                bulkCopyHistory.BatchSize = 1000;
+                bulkCopyHistory.BulkCopyTimeout = 0;
+                
+                foreach (DataColumn col in changedRows.Columns)
+                {
+                    bulkCopyHistory.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                }
+
+                bulkCopyHistory.WriteToServer(changedRows);
+                recordsInserted += changedRows.Rows.Count;
+
+                tableLogger.Information("Archived {Count} changed rows to history table {HistoryTable}", changedRows.Rows.Count, historyTableName);
+
+                // Bulk Delete old rows from target table where primary key in changedRows
+                var pkValues = changedRows.AsEnumerable()
+                    .Select(r => r[primaryKeyColumn]?.ToString()?.Trim().ToLowerInvariant())
+                    .Where(pk => !string.IsNullOrEmpty(pk))
+                    .ToList();
+
+                if (pkValues.Count > 0)
+                {
+                    var deleteCmd = new SqlCommand($@"
+                        DELETE FROM {targetSchema}.{tableName}
+                        WHERE {primaryKeyColumn} IN ({string.Join(",", pkValues.Select((_, i) => $"@pk{i}"))})", targetConn, transaction);
+
+                    deleteCmd.CommandTimeout = 0;
+
+                    for (int i = 0; i < pkValues.Count; i++)
+                    {
+                        deleteCmd.Parameters.AddWithValue($"@pk{i}", pkValues[i]);
                     }
 
-                    recordsInserted += insertCmd.ExecuteNonQuery();
+                    int deletedCount = deleteCmd.ExecuteNonQuery();
+                    tableLogger.Information("Deleted {Count} old rows from target {Table}", deletedCount, tableName);
                 }
+
+                // Insert New changed rows into target table remove identity columns from mapping
+                using var bulkCopyChanged = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
+                bulkCopyChanged.DestinationTableName = $"{targetSchema}.{tableName}";
+
+                bulkCopyChanged.BatchSize = 1000;
+                bulkCopyChanged.BulkCopyTimeout = 0;
+
+                foreach (DataColumn col in newChangedRows.Columns)
+                {
+                    if (!identityColumns.Contains(col.ColumnName))
+                    {
+                        bulkCopyChanged.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    }
+                }
+                bulkCopyChanged.WriteToServer(newChangedRows);
+                recordsInserted += newChangedRows.Rows.Count;
+                tableLogger.Information("Inserted {Count} changed rows into target {Table}", newChangedRows.Rows.Count, tableName);
+
             }
 
             transaction.Commit();
@@ -209,6 +276,7 @@ public static class TableCopyServiceWithVersioning_v2
             status = "Failed";
             errorMessage = ex.Message;
             tableLogger.Error(ex, "Error in versioned copy for {Table}", tableName);
+            transaction?.Rollback();
         }
         finally
         {
