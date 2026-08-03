@@ -126,6 +126,7 @@ public static class TableCopyServiceWithVersioning
                 string pk = srcRow[primaryKeyColumn]?.ToString()?.Trim().ToLowerInvariant() ?? "";
                 bool isNewRecord = !targetLookup.ContainsKey(pk);
                 bool updateDateChanged = false;
+                bool rowChanged = false;
                 tableLogger.Information("Processing record PK={PK}: IsNew={IsNew}", pk, isNewRecord);
 
                 if (!isNewRecord)
@@ -141,9 +142,30 @@ public static class TableCopyServiceWithVersioning
                     {
                         updateDateChanged = true;
                     }
+
+                    // Check if any other columns have changed (excluding identity and versioning columns)
+                    foreach (DataColumn col in srcTable.Columns)
+                    {
+                        if (identityColumns.Contains(col.ColumnName) || 
+                            string.Equals(col.ColumnName, "valid_start", StringComparison.OrdinalIgnoreCase) || 
+                            string.Equals(col.ColumnName, "valid_end", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue; // Skip identity and versioning columns
+                        }
+
+                        var srcValue = srcRow[col];
+                        var tgtValue = tgtRow[col];
+
+                        if (!object.Equals(srcValue, tgtValue))
+                        {
+                            rowChanged = true;
+                            tableLogger.Information("Column {Col} changed for PK={PK}: Source {SrcVal}, Target {TgtVal}", col.ColumnName, pk, srcValue, tgtValue);
+                            break; // No need to check further columns
+                        }
+                    }
                 }
 
-                if (isNewRecord || updateDateChanged)
+                if (isNewRecord || updateDateChanged || rowChanged)
                 {
                     DateTime newValidStart = TrimMs(Convert.ToDateTime(srcRow[updateDateColumn]));
                     DateTime newValidEnd = DateTime.Parse("9999-12-31 00:00:00.000"); // For SQL DATE type
@@ -158,6 +180,24 @@ public static class TableCopyServiceWithVersioning
 
                         closeCmd.CommandTimeout = 0;
                         closeCmd.Parameters.Add("@new_valid_start", SqlDbType.DateTime).Value = newValidStart;
+                        closeCmd.Parameters.AddWithValue("@pk", pk);
+                        closeCmd.Parameters.Add("@valid_end", SqlDbType.DateTime).Value = newValidEnd;
+                        closeCmd.ExecuteNonQuery();
+                    }
+
+                    if (rowChanged && !updateDateChanged)
+                    {
+                        //new valid start is the current timestamp for the new version
+                        DateTime newValidStartForRowhange = TrimMs(DateTime.Now);
+
+                        // Close previous record (set valid_end to previous day)
+                        var closeCmd = new SqlCommand($@"
+                            UPDATE {targetSchema}.{tableName}
+                            SET valid_end = DATEADD(MILLISECOND, -3, @new_valid_start)
+                            WHERE {primaryKeyColumn} = @pk AND valid_end = @valid_end", targetConn, transaction);
+
+                        closeCmd.CommandTimeout = 0;
+                        closeCmd.Parameters.Add("@new_valid_start", SqlDbType.DateTime).Value = newValidStartForRowhange;
                         closeCmd.Parameters.AddWithValue("@pk", pk);
                         closeCmd.Parameters.Add("@valid_end", SqlDbType.DateTime).Value = newValidEnd;
                         closeCmd.ExecuteNonQuery();
@@ -188,7 +228,8 @@ public static class TableCopyServiceWithVersioning
                         insertCmd.Parameters.AddWithValue("@" + col.ColumnName, srcRow[col] ?? DBNull.Value);
                     }
 
-                    insertCmd.Parameters.Add("@valid_start", SqlDbType.DateTime).Value = newValidStart;
+                    //insertCmd.Parameters.Add("@valid_start", SqlDbType.DateTime).Value = newValidStart;
+                    insertCmd.Parameters.Add("@valid_start", SqlDbType.DateTime).Value = rowChanged && !updateDateChanged ? TrimMs(DateTime.Now) : newValidStart;
                     insertCmd.Parameters.Add("@valid_end", SqlDbType.DateTime).Value = newValidEnd;
 
                     recordsInserted += insertCmd.ExecuteNonQuery();

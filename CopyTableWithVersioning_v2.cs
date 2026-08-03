@@ -68,7 +68,7 @@ public static class TableCopyServiceWithVersioning_v2
                 logCmd.Parameters.AddWithValue("@DateColumn", dateColumn);
                 logCmd.Parameters.AddWithValue("@UpdateDateColumn", updateDateColumn);
                 logCmd.Parameters.AddWithValue("@PrimaryKey", primaryKeyColumn);
-                logCmd.Parameters.AddWithValue("@Process", "Fact - SCD Type 2");
+                logCmd.Parameters.AddWithValue("@Process", "Fact - With Archive");
                 logCmd.Parameters.AddWithValue("@Status", status);
                 logCmd.Parameters.AddWithValue("@ErrorMessage", DBNull.Value);
 
@@ -121,27 +121,6 @@ public static class TableCopyServiceWithVersioning_v2
                 r => r
             );
 
-            // --- Step 3: Detect Identity Column in target ---
-            var identityColumns = new HashSet<string>();
-            using (var schemaCmd = new SqlCommand(@"
-                SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = @schema 
-                  AND TABLE_NAME = @table
-                  AND COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1", targetConn))
-            {
-                schemaCmd.Parameters.AddWithValue("@schema", targetSchema);
-                schemaCmd.Parameters.AddWithValue("@table", tableName);
-
-                using var reader = schemaCmd.ExecuteReader();
-                while (reader.Read())
-                {
-                    identityColumns.Add(reader.GetString(0));
-                }
-            }
-
-            if (identityColumns.Count > 0)
-                tableLogger.Information("Skipping identity columns: {Cols}", string.Join(", ", identityColumns));
 
             transaction = targetConn.BeginTransaction();
 
@@ -153,7 +132,7 @@ public static class TableCopyServiceWithVersioning_v2
             {
                 string pk = srcRow[primaryKeyColumn]?.ToString()?.Trim().ToLowerInvariant() ?? "";
                 bool isNewRecord = !targetLookup.ContainsKey(pk);
-                bool updateDateChanged = false;
+                bool rowChanged = false;
                 DataRow? tgtRow = null;
 
                 tableLogger.Information("Processing record PK={PK}: IsNew={IsNew}", pk, isNewRecord);
@@ -167,10 +146,22 @@ public static class TableCopyServiceWithVersioning_v2
 
                     tableLogger.Information("Comparing record PK={PK}: Source {SrcDate}, Target {TgtDate}", pk, srcUpdateDate, tgtUpdateDate);
 
-                    updateDateChanged = srcUpdateDate != tgtUpdateDate;
+                    //Compare all columns 
+                    foreach (DataColumn col in srcTable.Columns)
+                    {
+                        var srcValue = srcRow[col.ColumnName];
+                        var tgtValue = tgtRow[col.ColumnName];
+
+                        if (!object.Equals(srcValue, tgtValue))
+                        {
+                            rowChanged = true;
+                            tableLogger.Information("Change detected for PK={PK}, Column={Column}: Source={SrcValue}, Target={TgtValue}", pk, col.ColumnName, srcValue, tgtValue);
+                            break;
+                        }
+                    }
                 }
 
-                if (updateDateChanged && tgtRow != null)
+                if (rowChanged && tgtRow != null)
                 {
                     changedRows.ImportRow(tgtRow);     // archive old version
                     newChangedRows.ImportRow(srcRow);  // insert new version later
@@ -193,7 +184,7 @@ public static class TableCopyServiceWithVersioning_v2
 
                 foreach (DataColumn col in newRows.Columns)
                 {
-                    if (!identityColumns.Contains(col.ColumnName))
+                    // if (!identityColumns.Contains(col.ColumnName))
                     {
                         bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
                     }
@@ -258,7 +249,7 @@ public static class TableCopyServiceWithVersioning_v2
 
                 foreach (DataColumn col in newChangedRows.Columns)
                 {
-                    if (!identityColumns.Contains(col.ColumnName))
+                    // if (!identityColumns.Contains(col.ColumnName))
                     {
                         bulkCopyChanged.ColumnMappings.Add(col.ColumnName, col.ColumnName);
                     }
