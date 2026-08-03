@@ -144,24 +144,21 @@ public static class TableCopyServiceWithVersioning
                     }
 
                     // Check if any other columns have changed (excluding identity and versioning columns)
-                    foreach (DataColumn col in srcTable.Columns)
+                    foreach (DataColumn srcCol in srcTable.Columns)
                     {
-                        if (identityColumns.Contains(col.ColumnName) || 
-                            string.Equals(col.ColumnName, "valid_start", StringComparison.OrdinalIgnoreCase) || 
-                            string.Equals(col.ColumnName, "valid_end", StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue; // Skip identity and versioning columns
-                        }
+                        if (identityColumns.Contains(srcCol.ColumnName))
+                            continue;
 
-                        var srcValue = srcRow[col];
-                        var tgtValue = tgtRow[col];
+                        var srcValue = srcRow[srcCol.ColumnName];
+                        var tgtValue = tgtRow[srcCol.ColumnName];
 
                         if (!object.Equals(srcValue, tgtValue))
                         {
                             rowChanged = true;
-                            tableLogger.Information("Column {Col} changed for PK={PK}: Source {SrcVal}, Target {TgtVal}", col.ColumnName, pk, srcValue, tgtValue);
+                            tableLogger.Information("Column {Col} changed for PK={PK}: Source {SrcVal}, Target {TgtVal}", srcCol.ColumnName, pk, srcValue, tgtValue);
                             break; // No need to check further columns
                         }
+
                     }
                 }
 
