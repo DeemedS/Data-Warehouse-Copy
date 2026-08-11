@@ -110,40 +110,19 @@ public class BulkCopyManager
         Log.Information("Date Range: {DateFrom} to {DateTo}", dateFrom, dateTo);
         Log.Information("Tables to copy: {Tables}", string.Join(", ", tables.Select(t => t.TableName)));
 
-        Log.Information("Starting process for stored procedures: {Tables}", string.Join(", ", storedProcList.Select(t => t.TableName)));
-        foreach (var sproc in storedProcList)
+        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
+        foreach (var table in normalList)
         {
-            var now = DateTime.Now;
-            var effectiveDateFrom = dateFrom;
-            var effectiveDateTo = dateTo;
-
-            if (now.Hour == 0)
-            {
-                effectiveDateFrom = now.AddDays(-1).ToString("yyyy-MM-dd");
-                effectiveDateTo = now.AddDays(-1).ToString("yyyy-MM-dd");
-
-                Log.Information("Midnight run detected. Overriding date range to yesterday: {From} to {To}", effectiveDateFrom, effectiveDateTo);
-            }
-
-            StoredProcRunner.ExecuteStoredProc(
-                sproc.TableName!,
-                targetConnStr,
-                effectiveDateFrom!,
-                effectiveDateTo!
-            );
-        }
-
-        Log.Information("Starting process for historical tables: {Tables}", string.Join(", ", historicalList.Select(t => t.TableName)));
-        foreach (var table in historicalList)
-        {
-            TableCopyServiceWithVersioning.CopyTableWithVersioningFullIncremental(
+            TableCopyService.CopyTable(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,
                 targetSchema,
                 sourceSchema,
-                table.UpdateDateColumn!,
-                table.PrimaryKey!
+                dateFrom!,
+                dateTo!,
+                false,
+                table.DateColumn
             );
         }
 
@@ -164,19 +143,40 @@ public class BulkCopyManager
             );
         }
 
-        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
-        foreach (var table in normalList)
+        Log.Information("Starting process for historical tables: {Tables}", string.Join(", ", historicalList.Select(t => t.TableName)));
+        foreach (var table in historicalList)
         {
-            TableCopyService.CopyTable(
+            TableCopyServiceWithVersioning.CopyTableWithVersioningFullIncremental(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,
                 targetSchema,
                 sourceSchema,
-                dateFrom!,
-                dateTo!,
-                false,
-                table.DateColumn
+                table.UpdateDateColumn!,
+                table.PrimaryKey!
+            );
+        }
+
+        Log.Information("Starting process for stored procedures: {Tables}", string.Join(", ", storedProcList.Select(t => t.TableName)));
+        foreach (var sproc in storedProcList)
+        {
+            var now = DateTime.Now;
+            var effectiveDateFrom = dateFrom;
+            var effectiveDateTo = dateTo;
+
+            if (now.Hour == 0)
+            {
+                effectiveDateFrom = now.AddDays(-1).ToString("yyyy-MM-dd");
+                effectiveDateTo = now.AddDays(-1).ToString("yyyy-MM-dd");
+
+                Log.Information("Midnight run detected. Overriding date range to yesterday: {From} to {To}", effectiveDateFrom, effectiveDateTo);
+            }
+
+            StoredProcRunner.ExecuteStoredProc(
+                sproc.TableName!,
+                targetConnStr,
+                effectiveDateFrom!,
+                effectiveDateTo!
             );
         }
 
