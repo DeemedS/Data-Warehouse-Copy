@@ -99,6 +99,7 @@ public class BulkCopyManager
 
         var normalList = tables.Where(t => t.TableType == "fact" && string.IsNullOrEmpty(t.UpdateDateColumn) && string.IsNullOrEmpty(t.PrimaryKey)).ToList();
         var copyUpdateList = tables.Where(t => t.TableType == "fact" && !string.IsNullOrEmpty(t.UpdateDateColumn) && !string.IsNullOrEmpty(t.PrimaryKey)).ToList();
+        var idIncrementalList = tables.Where(t => t.TableType == "fact" && string.IsNullOrEmpty(t.UpdateDateColumn) && !string.IsNullOrEmpty(t.PrimaryKey)).ToList();
         var truncateList = tables.Where(t => t.TableType == "dim").ToList();
         var storedProcList = tables.Where(t => t.TableType == "sproc").ToList();
         var historicalList = tables.Where(t => t.TableType == "historical" && t.UpdateDateColumn != null && t.PrimaryKey != null).ToList();
@@ -110,26 +111,24 @@ public class BulkCopyManager
         Log.Information("Date Range: {DateFrom} to {DateTo}", dateFrom, dateTo);
         Log.Information("Tables to copy: {Tables}", string.Join(", ", tables.Select(t => t.TableName)));
 
-        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
-        foreach (var table in normalList)
+
+        Log.Information("Starting process for ID-incremental tables: {Tables}", string.Join(", ", idIncrementalList.Select(t => t.TableName)));
+        foreach (var table in idIncrementalList)
         {
-            TableCopyService.CopyTable(
+            IncrementalTableSyncById.SyncIncrementalTableById(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,
                 targetSchema,
                 sourceSchema,
-                dateFrom!,
-                dateTo!,
-                false,
-                table.DateColumn
+                table.PrimaryKey!
             );
         }
 
         Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
         foreach (var table in copyUpdateList)
         {
-            TableCopyServiceWithVersioning_v2.CopyTableWithVersioningFullIncremental_v2(
+            IncrementalTableSyncWithHistory.SyncIncrementalTableWithHistory(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,
@@ -143,10 +142,26 @@ public class BulkCopyManager
             );
         }
 
+        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
+        foreach (var table in normalList)
+        {
+            TableRefreshService.RefreshTable(
+                table.TableName!,
+                sourceConnStr,
+                targetConnStr,
+                targetSchema,
+                sourceSchema,
+                dateFrom!,
+                dateTo!,
+                false,
+                table.DateColumn
+            );
+        }
+
         Log.Information("Starting process for historical tables: {Tables}", string.Join(", ", historicalList.Select(t => t.TableName)));
         foreach (var table in historicalList)
         {
-            TableCopyServiceWithVersioning.CopyTableWithVersioningFullIncremental(
+            TableSyncSCD2.SyncSCD2(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,
@@ -183,7 +198,7 @@ public class BulkCopyManager
         Log.Information("Starting  process for tables: {Tables}", string.Join(", ", truncateList.Select(t => t.TableName)));
         Parallel.ForEach(truncateList, table =>
         {
-            TableCopyService.CopyTable(
+            TableRefreshService.RefreshTable(
                 table.TableName!,
                 sourceConnStr,
                 targetConnStr,

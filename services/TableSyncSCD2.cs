@@ -2,9 +2,9 @@ using Microsoft.Data.SqlClient;
 using Serilog;
 using System.Data;
 
-public static class TableCopyServiceWithVersioning
+public static class TableSyncSCD2
 {
-    public static void CopyTableWithVersioningFullIncremental(
+    public static void SyncSCD2(
         string tableName,
         string sourceConnStr,
         string targetConnStr,

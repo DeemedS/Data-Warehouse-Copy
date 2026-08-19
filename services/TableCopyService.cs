@@ -1,9 +1,9 @@
 using Microsoft.Data.SqlClient;
 using Serilog;
 
-public static class TableCopyService
+public static class TableRefreshService
 {
-    public static void CopyTable(
+    public static void RefreshTable(
         string tableName,
         string sourceConnStr,
         string targetConnStr,

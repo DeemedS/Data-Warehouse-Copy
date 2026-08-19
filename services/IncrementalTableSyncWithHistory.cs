@@ -2,9 +2,9 @@ using Microsoft.Data.SqlClient;
 using Serilog;
 using System.Data;
 
-public static class TableCopyServiceWithVersioning_v2
+public static class IncrementalTableSyncWithHistory
 {
-    public static void CopyTableWithVersioningFullIncremental_v2(
+    public static void SyncIncrementalTableWithHistory(
         string tableName,
         string sourceConnStr,
         string targetConnStr,
@@ -40,7 +40,7 @@ public static class TableCopyServiceWithVersioning_v2
             .CreateLogger()
             .ForContext("Table", tableName);
 
-        tableLogger.Information("Starting full incremental versioned copy for {Table}", tableName);
+        tableLogger.Information("Starting incremental sync with history for {Table}", tableName);
 
         SqlTransaction? transaction = null;
 
