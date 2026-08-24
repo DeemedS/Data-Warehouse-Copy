@@ -54,14 +54,14 @@ public class BulkCopyManager
             {
                 case "hourly":
                     var now = DateTime.Now;
-                    if (now.Hour == 0)
+                    if (now.Hour == 0 || now.Hour == 1)
                     {
-                        dateFrom = now.AddDays(-3).ToString("yyyy-MM-dd");
+                        dateFrom = now.AddDays(-1).ToString("yyyy-MM-dd");
                         dateTo = now.AddDays(-1).ToString("yyyy-MM-dd");
                     }
                     else
                     {
-                        dateFrom = now.AddDays(-1).ToString("yyyy-MM-dd");
+                        dateFrom = now.ToString("yyyy-MM-dd");
                         dateTo = now.ToString("yyyy-MM-dd");
                     }
                     break;

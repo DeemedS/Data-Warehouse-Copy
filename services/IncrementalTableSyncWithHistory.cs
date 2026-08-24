@@ -94,7 +94,7 @@ public static class IncrementalTableSyncWithHistory
             srcAdapter.Fill(srcTable);
             tableLogger.Information("Loaded {Count} rows from source {Table}", srcTable.Rows.Count, tableName);
 
-            // --- Step 2: Load active target data (valid_end IS NULL) ---
+            // --- Step 2: Load active target data
             var tgtCmd = new SqlCommand($@"
                 SELECT *
                 FROM {targetSchema}.{tableName}
