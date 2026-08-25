@@ -79,8 +79,8 @@ public static class IncrementalTableSyncWithHistory
             var srcCmd = new SqlCommand($@"
                 SELECT *
                 FROM {sourceSchema}.{tableName}
-                WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
-                OR {dateColumn} BETWEEN @StartDate AND @EndDate
+                     WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
+                         OR {dateColumn} BETWEEN @StartDate AND @EndDate
             ", sourceConn);
 
             srcCmd.Parameters.AddWithValue("@StartDate",
@@ -99,7 +99,7 @@ public static class IncrementalTableSyncWithHistory
                 SELECT *
                 FROM {targetSchema}.{tableName}
                 WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
-                OR {dateColumn} BETWEEN @StartDate AND @EndDate
+                    OR {dateColumn} BETWEEN @StartDate AND @EndDate
             ", targetConn);
 
             tgtCmd.CommandTimeout = 0;
@@ -113,11 +113,63 @@ public static class IncrementalTableSyncWithHistory
             tgtAdapter.Fill(tgtTable);
             tableLogger.Information("Loaded {Count} active rows from target {Table}", tgtTable.Rows.Count, tableName);
 
+            // Add target rows for source keys not already loaded by the target date filter.
+            var targetKeys = tgtTable.AsEnumerable()
+                .Where(r => r[primaryKeyColumn] != DBNull.Value)
+                .Select(r => r[primaryKeyColumn])
+                .ToHashSet();
+
+            using (var createKeyTableCmd = new SqlCommand($@"
+                SELECT TOP (0) [{primaryKeyColumn}]
+                INTO #SourceKeys
+                FROM {targetSchema}.{tableName}
+            ", targetConn))
+            {
+                createKeyTableCmd.CommandTimeout = 0;
+                createKeyTableCmd.ExecuteNonQuery();
+            }
+
+            var sourceKeys = srcTable.DefaultView.ToTable(true, primaryKeyColumn);
+            using (var sourceKeyBulkCopy = new SqlBulkCopy(targetConn))
+            {
+                sourceKeyBulkCopy.DestinationTableName = "#SourceKeys";
+                sourceKeyBulkCopy.BatchSize = 2000;
+                sourceKeyBulkCopy.BulkCopyTimeout = 0;
+                sourceKeyBulkCopy.ColumnMappings.Add(primaryKeyColumn, primaryKeyColumn);
+                sourceKeyBulkCopy.WriteToServer(sourceKeys);
+            }
+
+            int addedTargetRows = 0;
+            using (var mismatchTargetCmd = new SqlCommand($@"
+                SELECT target.*
+                FROM {targetSchema}.{tableName} AS target
+                INNER JOIN #SourceKeys AS source
+                    ON target.[{primaryKeyColumn}] = source.[{primaryKeyColumn}]
+            ", targetConn))
+            {
+                mismatchTargetCmd.CommandTimeout = 0;
+                using var mismatchTargetAdapter = new SqlDataAdapter(mismatchTargetCmd);
+                using var mismatchTargetTable = new DataTable();
+                mismatchTargetAdapter.Fill(mismatchTargetTable);
+
+                foreach (DataRow targetRow in mismatchTargetTable.Rows)
+                {
+                    var targetKey = targetRow[primaryKeyColumn];
+                    if (targetKey != DBNull.Value && targetKeys.Add(targetKey))
+                    {
+                        tgtTable.ImportRow(targetRow);
+                        addedTargetRows++;
+                    }
+                }
+            }
+
+            tableLogger.Information("Added {Count} target rows for source keys not loaded in target", addedTargetRows);
+
             // Build target lookup by primary key
             var targetLookup = tgtTable.AsEnumerable()
             .Where(r => r[primaryKeyColumn] != DBNull.Value)
             .ToDictionary(
-                r => r[primaryKeyColumn].ToString()!.Trim().ToLowerInvariant(),
+                r => r[primaryKeyColumn],
                 r => r
             );
 
@@ -130,21 +182,21 @@ public static class IncrementalTableSyncWithHistory
 
             foreach (DataRow srcRow in srcTable.Rows)
             {
-                string pk = srcRow[primaryKeyColumn]?.ToString()?.Trim().ToLowerInvariant() ?? "";
-                bool isNewRecord = !targetLookup.ContainsKey(pk);
+                object pkValue = srcRow[primaryKeyColumn];
+                bool isNewRecord = pkValue == DBNull.Value || !targetLookup.ContainsKey(pkValue);
                 bool rowChanged = false;
                 DataRow? tgtRow = null;
 
-                tableLogger.Information("Processing record PK={PK}: IsNew={IsNew}", pk, isNewRecord);
+                tableLogger.Information("Processing record PK={PK}: IsNew={IsNew}", pkValue, isNewRecord);
 
                 if (!isNewRecord)
                 {
-                    tgtRow = targetLookup[pk];
+                    tgtRow = targetLookup[pkValue];
 
                     DateTime srcUpdateDate = Convert.ToDateTime(srcRow[updateDateColumn ?? throw new ArgumentNullException(nameof(updateDateColumn))]);
                     DateTime tgtUpdateDate = Convert.ToDateTime(tgtRow[updateDateColumn ?? throw new ArgumentNullException(nameof(updateDateColumn))]);
 
-                    tableLogger.Information("Comparing record PK={PK}: Source {SrcDate}, Target {TgtDate}", pk, srcUpdateDate, tgtUpdateDate);
+                    tableLogger.Information("Comparing record PK={PK}: Source {SrcDate}, Target {TgtDate}", pkValue, srcUpdateDate, tgtUpdateDate);
 
                     //Compare all columns 
                     foreach (DataColumn col in srcTable.Columns)
@@ -155,7 +207,7 @@ public static class IncrementalTableSyncWithHistory
                         if (!object.Equals(srcValue, tgtValue))
                         {
                             rowChanged = true;
-                            tableLogger.Information("Change detected for PK={PK}, Column={Column}: Source={SrcValue}, Target={TgtValue}", pk, col.ColumnName, srcValue, tgtValue);
+                            tableLogger.Information("Change detected for PK={PK}, Column={Column}: Source={SrcValue}, Target={TgtValue}", pkValue, col.ColumnName, srcValue, tgtValue);
                             break;
                         }
                     }
@@ -217,28 +269,36 @@ public static class IncrementalTableSyncWithHistory
 
                 tableLogger.Information("Archived {Count} changed rows to history table {HistoryTable}", changedRows.Rows.Count, historyTableName);
 
-                // Bulk Delete old rows from target table where primary key in changedRows
-                var pkValues = changedRows.AsEnumerable()
-                    .Select(r => r[primaryKeyColumn]?.ToString()?.Trim().ToLowerInvariant())
-                    .Where(pk => !string.IsNullOrEmpty(pk))
-                    .ToList();
-
-                if (pkValues.Count > 0)
+                // Delete old rows from target table using a typed key temp table.
+                var changedKeys = changedRows.DefaultView.ToTable(true, primaryKeyColumn);
+                using (var createChangedKeyTableCmd = new SqlCommand($@"
+                    SELECT TOP (0) [{primaryKeyColumn}]
+                    INTO #ChangedKeys
+                    FROM {targetSchema}.{tableName}
+                ", targetConn, transaction))
                 {
-                    var deleteCmd = new SqlCommand($@"
-                        DELETE FROM {targetSchema}.{tableName}
-                        WHERE {primaryKeyColumn} IN ({string.Join(",", pkValues.Select((_, i) => $"@pk{i}"))})", targetConn, transaction);
-
-                    deleteCmd.CommandTimeout = 0;
-
-                    for (int i = 0; i < pkValues.Count; i++)
-                    {
-                        deleteCmd.Parameters.AddWithValue($"@pk{i}", pkValues[i]);
-                    }
-
-                    int deletedCount = deleteCmd.ExecuteNonQuery();
-                    tableLogger.Information("Deleted {Count} old rows from target {Table}", deletedCount, tableName);
+                    createChangedKeyTableCmd.CommandTimeout = 0;
+                    createChangedKeyTableCmd.ExecuteNonQuery();
                 }
+
+                using (var changedKeyBulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.Default, transaction))
+                {
+                    changedKeyBulkCopy.DestinationTableName = "#ChangedKeys";
+                    changedKeyBulkCopy.BatchSize = 2000;
+                    changedKeyBulkCopy.BulkCopyTimeout = 0;
+                    changedKeyBulkCopy.ColumnMappings.Add(primaryKeyColumn, primaryKeyColumn);
+                    changedKeyBulkCopy.WriteToServer(changedKeys);
+                }
+
+                using var deleteCmd = new SqlCommand($@"
+                    DELETE target
+                    FROM {targetSchema}.{tableName} AS target
+                    INNER JOIN #ChangedKeys AS changed
+                        ON target.[{primaryKeyColumn}] = changed.[{primaryKeyColumn}]", targetConn, transaction);
+
+                deleteCmd.CommandTimeout = 0;
+                int deletedCount = deleteCmd.ExecuteNonQuery();
+                tableLogger.Information("Deleted {Count} old rows from target {Table}", deletedCount, tableName);
 
                 // Insert New changed rows into target table remove identity columns from mapping
                 using var bulkCopyChanged = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
