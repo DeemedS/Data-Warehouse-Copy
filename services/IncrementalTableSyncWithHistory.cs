@@ -94,31 +94,6 @@ public static class IncrementalTableSyncWithHistory
             srcAdapter.Fill(srcTable);
             tableLogger.Information("Loaded {Count} rows from source {Table}", srcTable.Rows.Count, tableName);
 
-            // --- Step 2: Load active target data
-            var tgtCmd = new SqlCommand($@"
-                SELECT *
-                FROM {targetSchema}.{tableName}
-                WHERE {updateDateColumn} BETWEEN @StartDate AND @EndDate
-                    OR {dateColumn} BETWEEN @StartDate AND @EndDate
-            ", targetConn);
-
-            tgtCmd.CommandTimeout = 0;
-            tgtCmd.Parameters.AddWithValue("@PK", primaryKeyColumn);
-            tgtCmd.Parameters.AddWithValue("@StartDate",
-                !string.IsNullOrEmpty(startDate) ? DateTime.Parse(startDate).Date : throw new ArgumentNullException(nameof(startDate))); // beginning of day
-            tgtCmd.Parameters.AddWithValue("@EndDate",
-                !string.IsNullOrEmpty(endDate) ? DateTime.Parse(endDate).Date.AddDays(1).AddMilliseconds(-3) : throw new ArgumentNullException(nameof(endDate))); // end of day 23:59:59.997
-            var tgtAdapter = new SqlDataAdapter(tgtCmd);
-            var tgtTable = new DataTable();
-            tgtAdapter.Fill(tgtTable);
-            tableLogger.Information("Loaded {Count} active rows from target {Table}", tgtTable.Rows.Count, tableName);
-
-            // Add target rows for source keys not already loaded by the target date filter.
-            var targetKeys = tgtTable.AsEnumerable()
-                .Where(r => r[primaryKeyColumn] != DBNull.Value)
-                .Select(r => r[primaryKeyColumn])
-                .ToHashSet();
-
             using (var createKeyTableCmd = new SqlCommand($@"
                 SELECT TOP (0) [{primaryKeyColumn}]
                 INTO #SourceKeys
@@ -139,31 +114,19 @@ public static class IncrementalTableSyncWithHistory
                 sourceKeyBulkCopy.WriteToServer(sourceKeys);
             }
 
-            int addedTargetRows = 0;
-            using (var mismatchTargetCmd = new SqlCommand($@"
+            // --- Step 2: Load target rows for the date-filtered source keys ---
+            using var tgtCmd = new SqlCommand($@"
                 SELECT target.*
                 FROM {targetSchema}.{tableName} AS target
                 INNER JOIN #SourceKeys AS source
                     ON target.[{primaryKeyColumn}] = source.[{primaryKeyColumn}]
-            ", targetConn))
-            {
-                mismatchTargetCmd.CommandTimeout = 0;
-                using var mismatchTargetAdapter = new SqlDataAdapter(mismatchTargetCmd);
-                using var mismatchTargetTable = new DataTable();
-                mismatchTargetAdapter.Fill(mismatchTargetTable);
+            ", targetConn);
 
-                foreach (DataRow targetRow in mismatchTargetTable.Rows)
-                {
-                    var targetKey = targetRow[primaryKeyColumn];
-                    if (targetKey != DBNull.Value && targetKeys.Add(targetKey))
-                    {
-                        tgtTable.ImportRow(targetRow);
-                        addedTargetRows++;
-                    }
-                }
-            }
-
-            tableLogger.Information("Added {Count} target rows for source keys not loaded in target", addedTargetRows);
+            tgtCmd.CommandTimeout = 0;
+            using var tgtAdapter = new SqlDataAdapter(tgtCmd);
+            var tgtTable = new DataTable();
+            tgtAdapter.Fill(tgtTable);
+            tableLogger.Information("Loaded {Count} target rows for source keys from {Table}", tgtTable.Rows.Count, tableName);
 
             // Build target lookup by primary key
             var targetLookup = tgtTable.AsEnumerable()
