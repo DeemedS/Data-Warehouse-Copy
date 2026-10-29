@@ -43,8 +43,8 @@ public static class TableSyncSCD2
         {
             using var sourceConn = new SqlConnection(sourceConnStr);
             using var targetConn = new SqlConnection(targetConnStr);
-            sourceConn.Open();
-            targetConn.Open();
+            SqlConnectionRetry.OpenWithRetry(sourceConn, tableLogger, "source");
+            SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target");
 
             // --- Insert initial log row ---
             using (var logCmd = new SqlCommand(@"
@@ -97,27 +97,27 @@ public static class TableSyncSCD2
                 r => r
             );
 
-            // --- Step 3: Detect Identity Column in target ---
-            var identityColumns = new HashSet<string>();
-            using (var schemaCmd = new SqlCommand(@"
-                SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = @schema 
-                  AND TABLE_NAME = @table
-                  AND COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1", targetConn))
-            {
-                schemaCmd.Parameters.AddWithValue("@schema", targetSchema);
-                schemaCmd.Parameters.AddWithValue("@table", tableName);
+            // // --- Step 3: Detect Identity Column in target ---
+            // var identityColumns = new HashSet<string>();
+            // using (var schemaCmd = new SqlCommand(@"
+            //     SELECT COLUMN_NAME
+            //     FROM INFORMATION_SCHEMA.COLUMNS
+            //     WHERE TABLE_SCHEMA = @schema 
+            //       AND TABLE_NAME = @table
+            //       AND COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1", targetConn))
+            // {
+            //     schemaCmd.Parameters.AddWithValue("@schema", targetSchema);
+            //     schemaCmd.Parameters.AddWithValue("@table", tableName);
 
-                using var reader = schemaCmd.ExecuteReader();
-                while (reader.Read())
-                {
-                    identityColumns.Add(reader.GetString(0));
-                }
-            }
+            //     using var reader = schemaCmd.ExecuteReader();
+            //     while (reader.Read())
+            //     {
+            //         identityColumns.Add(reader.GetString(0));
+            //     }
+            // }
 
-            if (identityColumns.Count > 0)
-                tableLogger.Information("Skipping identity columns: {Cols}", string.Join(", ", identityColumns));
+            // if (identityColumns.Count > 0)
+            //     tableLogger.Information("Skipping identity columns: {Cols}", string.Join(", ", identityColumns));
 
             using var transaction = targetConn.BeginTransaction();
 
@@ -147,8 +147,8 @@ public static class TableSyncSCD2
                     // Check if any other columns have changed (excluding identity and versioning columns)
                     foreach (DataColumn srcCol in srcTable.Columns)
                     {
-                        if (identityColumns.Contains(srcCol.ColumnName))
-                            continue;
+                        // if (identityColumns.Contains(srcCol.ColumnName))
+                        //     continue;
 
                         var srcValue = srcRow[srcCol.ColumnName];
                         var tgtValue = tgtRow[srcCol.ColumnName];
@@ -200,9 +200,8 @@ public static class TableSyncSCD2
                         closeCmd.ExecuteNonQuery();
                     }
 
-                    // Build insert excluding identity columns
+                    // Build insert columns, including the ID column when present
                     var columnNames = srcTable.Columns.Cast<DataColumn>()
-                        .Where(c => !string.Equals(c.ColumnName, "id", StringComparison.OrdinalIgnoreCase))
                         .Select(c => c.ColumnName)
                         .ToList();
 
@@ -219,9 +218,6 @@ public static class TableSyncSCD2
 
                     foreach (var col in srcTable.Columns.Cast<DataColumn>())
                     {
-                        if (string.Equals(col.ColumnName, "id", StringComparison.OrdinalIgnoreCase))
-                            continue;
-
                         insertCmd.Parameters.AddWithValue("@" + col.ColumnName, srcRow[col] ?? DBNull.Value);
                     }
 
@@ -248,7 +244,7 @@ public static class TableSyncSCD2
             try
             {
                 using var targetConn = new SqlConnection(targetConnStr);
-                targetConn.Open();
+                SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target log");
 
                 using var updateCmd = new SqlCommand(@"
                     UPDATE bronze.tbl_dw_copy_logs

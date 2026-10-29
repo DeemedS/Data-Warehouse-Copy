@@ -12,7 +12,7 @@ public static class IncrementalTableSyncWithHistory
         string sourceSchema,
         string startDate,
         string endDate,
-        string? dateColumn, 
+        string? dateColumn,
         string? updateDateColumn,
         string primaryKeyColumn
     )
@@ -48,8 +48,8 @@ public static class IncrementalTableSyncWithHistory
         {
             using var sourceConn = new SqlConnection(sourceConnStr);
             using var targetConn = new SqlConnection(targetConnStr);
-            sourceConn.Open();
-            targetConn.Open();
+            SqlConnectionRetry.OpenWithRetry(sourceConn, tableLogger, "source");
+            SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target");
 
             // --- Insert initial log row ---
             using (var logCmd = new SqlCommand(@"
@@ -89,43 +89,58 @@ public static class IncrementalTableSyncWithHistory
                 !string.IsNullOrEmpty(endDate) ? DateTime.Parse(endDate).Date.AddDays(1).AddMilliseconds(-3) : throw new ArgumentNullException(nameof(endDate))); // end of day 23:59:59.997
 
             srcCmd.CommandTimeout = 0;
-            var srcAdapter = new SqlDataAdapter(srcCmd);
-            var srcTable = new DataTable();
-            srcAdapter.Fill(srcTable);
+            var srcTable = ExecuteWithConnectionRetry(
+                sourceConn,
+                tableLogger,
+                "source data load",
+                () =>
+                {
+                    var table = new DataTable();
+                    using var adapter = new SqlDataAdapter(srcCmd);
+                    adapter.Fill(table);
+                    return table;
+                });
             tableLogger.Information("Loaded {Count} rows from source {Table}", srcTable.Rows.Count, tableName);
 
-            using (var createKeyTableCmd = new SqlCommand($@"
-                SELECT TOP (0) [{primaryKeyColumn}]
-                INTO #SourceKeys
-                FROM {targetSchema}.{tableName}
-            ", targetConn))
-            {
-                createKeyTableCmd.CommandTimeout = 0;
-                createKeyTableCmd.ExecuteNonQuery();
-            }
-
             var sourceKeys = srcTable.DefaultView.ToTable(true, primaryKeyColumn);
-            using (var sourceKeyBulkCopy = new SqlBulkCopy(targetConn))
-            {
-                sourceKeyBulkCopy.DestinationTableName = "#SourceKeys";
-                sourceKeyBulkCopy.BatchSize = 2000;
-                sourceKeyBulkCopy.BulkCopyTimeout = 0;
-                sourceKeyBulkCopy.ColumnMappings.Add(primaryKeyColumn, primaryKeyColumn);
-                sourceKeyBulkCopy.WriteToServer(sourceKeys);
-            }
+            var tgtTable = ExecuteWithConnectionRetry(
+                targetConn,
+                tableLogger,
+                "target data load",
+                () =>
+                {
+                    using (var createKeyTableCmd = new SqlCommand($@"
+                        SELECT TOP (0) [{primaryKeyColumn}]
+                        INTO #SourceKeys
+                        FROM {targetSchema}.{tableName}
+                    ", targetConn))
+                    {
+                        createKeyTableCmd.CommandTimeout = 0;
+                        createKeyTableCmd.ExecuteNonQuery();
+                    }
 
-            // --- Step 2: Load target rows for the date-filtered source keys ---
-            using var tgtCmd = new SqlCommand($@"
-                SELECT target.*
-                FROM {targetSchema}.{tableName} AS target
-                INNER JOIN #SourceKeys AS source
-                    ON target.[{primaryKeyColumn}] = source.[{primaryKeyColumn}]
-            ", targetConn);
+                    using (var sourceKeyBulkCopy = new SqlBulkCopy(targetConn))
+                    {
+                        sourceKeyBulkCopy.DestinationTableName = "#SourceKeys";
+                        sourceKeyBulkCopy.BatchSize = 2000;
+                        sourceKeyBulkCopy.BulkCopyTimeout = 0;
+                        sourceKeyBulkCopy.ColumnMappings.Add(primaryKeyColumn, primaryKeyColumn);
+                        sourceKeyBulkCopy.WriteToServer(sourceKeys);
+                    }
 
-            tgtCmd.CommandTimeout = 0;
-            using var tgtAdapter = new SqlDataAdapter(tgtCmd);
-            var tgtTable = new DataTable();
-            tgtAdapter.Fill(tgtTable);
+                    using var tgtCmd = new SqlCommand($@"
+                        SELECT target.*
+                        FROM {targetSchema}.{tableName} AS target
+                        INNER JOIN #SourceKeys AS source
+                            ON target.[{primaryKeyColumn}] = source.[{primaryKeyColumn}]
+                    ", targetConn);
+                    tgtCmd.CommandTimeout = 0;
+
+                    var table = new DataTable();
+                    using var adapter = new SqlDataAdapter(tgtCmd);
+                    adapter.Fill(table);
+                    return table;
+                });
             tableLogger.Information("Loaded {Count} target rows for source keys from {Table}", tgtTable.Rows.Count, tableName);
 
             // Build target lookup by primary key
@@ -136,8 +151,6 @@ public static class IncrementalTableSyncWithHistory
                 r => r
             );
 
-
-            transaction = targetConn.BeginTransaction();
 
             var changedRows = tgtTable.Clone();
             var newRows = tgtTable.Clone();
@@ -186,104 +199,154 @@ public static class IncrementalTableSyncWithHistory
                 {
                     newRows.ImportRow(srcRow);
                 }
-    
+
             }
 
-            // --- Step 4: Insert new rows ---
-            if (newRows.Rows.Count > 0)
+            const int maxWriteAttempts = 3;
+            for (var attempt = 1; ; attempt++)
             {
-                using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
-                bulkCopy.DestinationTableName = $"{targetSchema}.{tableName}";
-                bulkCopy.BatchSize = 1000;
-                bulkCopy.BulkCopyTimeout = 0;
+                long attemptRecordsInserted = 0;
 
-                foreach (DataColumn col in newRows.Columns)
+                try
                 {
-                    // if (!identityColumns.Contains(col.ColumnName))
+                    transaction = targetConn.BeginTransaction();
+                    // --- Step 4: Insert new rows ---
+                    if (newRows.Rows.Count > 0)
                     {
-                        bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                        using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
+                        bulkCopy.DestinationTableName = $"{targetSchema}.{tableName}";
+                        bulkCopy.BatchSize = 1000;
+                        bulkCopy.BulkCopyTimeout = 0;
+
+                        foreach (DataColumn col in newRows.Columns)
+                        {
+                            // if (!identityColumns.Contains(col.ColumnName))
+                            {
+                                bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                            }
+                        }
+
+                        bulkCopy.WriteToServer(newRows);
+                        attemptRecordsInserted += newRows.Rows.Count;
+
+                        tableLogger.Information("Inserted {Count} new rows into target {Table}", newRows.Rows.Count, tableName);
                     }
-                }
 
-                bulkCopy.WriteToServer(newRows);
-                recordsInserted += newRows.Rows.Count;
+                    // --- Step 5: Update changed rows ---
+                    if (changedRows.Rows.Count > 0)
+                    {
+                        //Archive old rows to _history table
+                        var historyTableName = $"{tableName}_history";
 
-                tableLogger.Information("Inserted {Count} new rows into target {Table}", newRows.Rows.Count, tableName);
-            }
+                        using var bulkCopyHistory = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
+                        bulkCopyHistory.DestinationTableName = $"{targetSchema}.{historyTableName}";
+                        bulkCopyHistory.BatchSize = 1000;
+                        bulkCopyHistory.BulkCopyTimeout = 0;
 
-            // --- Step 5: Update changed rows ---
-            if (changedRows.Rows.Count > 0)
-            {
-                //Archive old rows to _history table
-                var historyTableName = $"{tableName}_history";
-                
-                using var bulkCopyHistory = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
-                bulkCopyHistory.DestinationTableName = $"{targetSchema}.{historyTableName}";
-                bulkCopyHistory.BatchSize = 1000;
-                bulkCopyHistory.BulkCopyTimeout = 0;
-                
-                foreach (DataColumn col in changedRows.Columns)
-                {
-                    bulkCopyHistory.ColumnMappings.Add(col.ColumnName, col.ColumnName);
-                }
+                        foreach (DataColumn col in changedRows.Columns)
+                        {
+                            bulkCopyHistory.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                        }
 
-                bulkCopyHistory.WriteToServer(changedRows);
-                recordsInserted += changedRows.Rows.Count;
+                        bulkCopyHistory.WriteToServer(changedRows);
+                        attemptRecordsInserted += changedRows.Rows.Count;
 
-                tableLogger.Information("Archived {Count} changed rows to history table {HistoryTable}", changedRows.Rows.Count, historyTableName);
+                        tableLogger.Information("Archived {Count} changed rows to history table {HistoryTable}", changedRows.Rows.Count, historyTableName);
 
-                // Delete old rows from target table using a typed key temp table.
-                var changedKeys = changedRows.DefaultView.ToTable(true, primaryKeyColumn);
-                using (var createChangedKeyTableCmd = new SqlCommand($@"
+                        // Delete old rows from target table using a typed key temp table.
+                        var changedKeys = changedRows.DefaultView.ToTable(true, primaryKeyColumn);
+                        using (var createChangedKeyTableCmd = new SqlCommand($@"
                     SELECT TOP (0) [{primaryKeyColumn}]
                     INTO #ChangedKeys
                     FROM {targetSchema}.{tableName}
                 ", targetConn, transaction))
-                {
-                    createChangedKeyTableCmd.CommandTimeout = 0;
-                    createChangedKeyTableCmd.ExecuteNonQuery();
-                }
+                        {
+                            createChangedKeyTableCmd.CommandTimeout = 0;
+                            createChangedKeyTableCmd.ExecuteNonQuery();
+                        }
 
-                using (var changedKeyBulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.Default, transaction))
-                {
-                    changedKeyBulkCopy.DestinationTableName = "#ChangedKeys";
-                    changedKeyBulkCopy.BatchSize = 2000;
-                    changedKeyBulkCopy.BulkCopyTimeout = 0;
-                    changedKeyBulkCopy.ColumnMappings.Add(primaryKeyColumn, primaryKeyColumn);
-                    changedKeyBulkCopy.WriteToServer(changedKeys);
-                }
+                        using (var changedKeyBulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.Default, transaction))
+                        {
+                            changedKeyBulkCopy.DestinationTableName = "#ChangedKeys";
+                            changedKeyBulkCopy.BatchSize = 2000;
+                            changedKeyBulkCopy.BulkCopyTimeout = 0;
+                            changedKeyBulkCopy.ColumnMappings.Add(primaryKeyColumn, primaryKeyColumn);
+                            changedKeyBulkCopy.WriteToServer(changedKeys);
+                        }
 
-                using var deleteCmd = new SqlCommand($@"
+                        using var deleteCmd = new SqlCommand($@"
                     DELETE target
                     FROM {targetSchema}.{tableName} AS target
                     INNER JOIN #ChangedKeys AS changed
                         ON target.[{primaryKeyColumn}] = changed.[{primaryKeyColumn}]", targetConn, transaction);
 
-                deleteCmd.CommandTimeout = 0;
-                int deletedCount = deleteCmd.ExecuteNonQuery();
-                tableLogger.Information("Deleted {Count} old rows from target {Table}", deletedCount, tableName);
+                        deleteCmd.CommandTimeout = 0;
+                        int deletedCount = deleteCmd.ExecuteNonQuery();
+                        tableLogger.Information("Deleted {Count} old rows from target {Table}", deletedCount, tableName);
 
-                // Insert New changed rows into target table remove identity columns from mapping
-                using var bulkCopyChanged = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
-                bulkCopyChanged.DestinationTableName = $"{targetSchema}.{tableName}";
+                        // Insert New changed rows into target table remove identity columns from mapping
+                        using var bulkCopyChanged = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.KeepIdentity, transaction);
+                        bulkCopyChanged.DestinationTableName = $"{targetSchema}.{tableName}";
 
-                bulkCopyChanged.BatchSize = 1000;
-                bulkCopyChanged.BulkCopyTimeout = 0;
+                        bulkCopyChanged.BatchSize = 1000;
+                        bulkCopyChanged.BulkCopyTimeout = 0;
 
-                foreach (DataColumn col in newChangedRows.Columns)
-                {
-                    // if (!identityColumns.Contains(col.ColumnName))
-                    {
-                        bulkCopyChanged.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                        foreach (DataColumn col in newChangedRows.Columns)
+                        {
+                            // if (!identityColumns.Contains(col.ColumnName))
+                            {
+                                bulkCopyChanged.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                            }
+                        }
+                        bulkCopyChanged.WriteToServer(newChangedRows);
+                        attemptRecordsInserted += newChangedRows.Rows.Count;
+                        tableLogger.Information("Inserted {Count} changed rows into target {Table}", newChangedRows.Rows.Count, tableName);
+
                     }
                 }
-                bulkCopyChanged.WriteToServer(newChangedRows);
-                recordsInserted += newChangedRows.Rows.Count;
-                tableLogger.Information("Inserted {Count} changed rows into target {Table}", newChangedRows.Rows.Count, tableName);
+                catch (Exception ex) when (attempt < maxWriteAttempts)
+                {
+                    try
+                    {
+                        transaction?.Rollback();
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        if (targetConn.State is not (ConnectionState.Broken or ConnectionState.Closed))
+                        {
+                            throw new AggregateException("Write failed and the transaction could not be rolled back.", ex, rollbackEx);
+                        }
 
+                        tableLogger.Warning(rollbackEx, "Connection was lost while rolling back write attempt {Attempt} for {Table}", attempt, tableName);
+                    }
+
+                    transaction?.Dispose();
+                    transaction = null;
+
+                    tableLogger.Warning(
+                        ex,
+                        "Write attempt {Attempt}/{MaxAttempts} failed for {Table}; retrying the complete transaction in one minute",
+                        attempt,
+                        maxWriteAttempts,
+                        tableName);
+
+                    if (targetConn.State is ConnectionState.Broken or ConnectionState.Closed)
+                    {
+                        targetConn.Close();
+                        SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target");
+                    }
+
+                    Thread.Sleep(TimeSpan.FromMinutes(1));
+                    continue;
+                }
+
+                transaction.Commit();
+                recordsInserted = attemptRecordsInserted;
+                transaction.Dispose();
+                transaction = null;
+                break;
             }
 
-            transaction.Commit();
             status = "Completed";
             tableLogger.Information("Inserted {Count} versioned rows for {Table}", recordsInserted, tableName);
         }
@@ -292,14 +355,21 @@ public static class IncrementalTableSyncWithHistory
             status = "Failed";
             errorMessage = ex.Message;
             tableLogger.Error(ex, "Error in versioned copy for {Table}", tableName);
-            transaction?.Rollback();
+            try
+            {
+                transaction?.Rollback();
+            }
+            catch (Exception rollbackEx)
+            {
+                tableLogger.Error(rollbackEx, "Rollback failed for {Table}", tableName);
+            }
         }
         finally
         {
             try
             {
                 using var targetConn = new SqlConnection(targetConnStr);
-                targetConn.Open();
+                SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target log");
 
                 using var updateCmd = new SqlCommand(@"
                     UPDATE bronze.tbl_dw_copy_logs
@@ -324,4 +394,36 @@ public static class IncrementalTableSyncWithHistory
             }
         }
     }
+
+    private static T ExecuteWithConnectionRetry<T>(
+        SqlConnection connection,
+        ILogger logger,
+        string operationName,
+        Func<T> operation)
+    {
+        const int maxAttempts = 3;
+
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return operation();
+            }
+            catch (Exception ex) when (attempt < maxAttempts)
+            {
+                var delay = TimeSpan.FromMinutes(1);
+                logger.Warning(
+                    ex,
+                    "Failed to {OperationName} (attempt {Attempt}/{MaxAttempts}); retrying in {Delay}",
+                    operationName,
+                    attempt,
+                    maxAttempts,
+                    delay);
+                connection.Close();
+                Thread.Sleep(delay);
+                SqlConnectionRetry.OpenWithRetry(connection, logger, operationName);
+            }
+        }
+    }
+
 }

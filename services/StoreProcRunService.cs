@@ -23,7 +23,7 @@ public static class StoredProcRunner
             cmd.Parameters.AddWithValue("@StartDateParam", startDate);
             cmd.Parameters.AddWithValue("@EndDateParam", endDate);
 
-            conn.Open();
+            SqlConnectionRetry.OpenWithRetry(conn, Log.Logger, "stored procedure");
             cmd.ExecuteNonQuery();
 
             Log.Information("Stored procedure {StoredProc} executed successfully for range {StartDate} to {EndDate}.",
@@ -35,4 +35,5 @@ public static class StoredProcRunner
             throw;
         }
     }
+
 }

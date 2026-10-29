@@ -125,22 +125,6 @@ public class BulkCopyManager
             );
         }
 
-        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
-        foreach (var table in copyUpdateList)
-        {
-            IncrementalTableSyncWithHistory.SyncIncrementalTableWithHistory(
-                table.TableName!,
-                sourceConnStr,
-                targetConnStr,
-                targetSchema,
-                sourceSchema,
-                dateFrom!,
-                dateTo!,
-                table.DateColumn,
-                table.UpdateDateColumn,
-                table.PrimaryKey!
-            );
-        }
 
         Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
         foreach (var table in normalList)
@@ -210,6 +194,23 @@ public class BulkCopyManager
                 table.DateColumn
             );
         });
+
+        Log.Information("Starting process for tables: {Tables}", string.Join(", ", normalList.Select(t => t.TableName)));
+        foreach (var table in copyUpdateList)
+        {
+            IncrementalTableSyncWithHistory.SyncIncrementalTableWithHistory(
+                table.TableName!,
+                sourceConnStr,
+                targetConnStr,
+                targetSchema,
+                sourceSchema,
+                dateFrom!,
+                dateTo!,
+                table.DateColumn,
+                table.UpdateDateColumn,
+                table.PrimaryKey!
+            );
+        }
 
         Log.Information("All tables processed.");
     }

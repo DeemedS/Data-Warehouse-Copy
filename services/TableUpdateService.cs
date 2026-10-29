@@ -49,8 +49,8 @@ public static class TableUpdateService
             using var sourceConn = new SqlConnection(sourceConnStr);
             using var targetConn = new SqlConnection(targetConnStr);
 
-            sourceConn.Open();
-            targetConn.Open();
+            SqlConnectionRetry.OpenWithRetry(sourceConn, tableLogger, "source");
+            SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target");
 
             // Insert initial log row
             using (var logCmd = new SqlCommand(@"
@@ -195,7 +195,7 @@ public static class TableUpdateService
         finally
         {
             using var finalConn = new SqlConnection(targetConnStr);
-            finalConn.Open();
+            SqlConnectionRetry.OpenWithRetry(finalConn, tableLogger, "target log");
             using var updateCmd = new SqlCommand(@"
                 UPDATE bronze.tbl_dw_copy_logs
                 SET EndTime = @EndTime,
@@ -214,4 +214,5 @@ public static class TableUpdateService
             tableLogger.Information("Finished processing {Table}", tableName);
         }
     }
+
 }

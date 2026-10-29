@@ -44,8 +44,8 @@ public static class IncrementalTableSyncById
 		{
 			using var sourceConn = new SqlConnection(sourceConnStr);
 			using var targetConn = new SqlConnection(targetConnStr);
-			sourceConn.Open();
-			targetConn.Open();
+			SqlConnectionRetry.OpenWithRetry(sourceConn, tableLogger, "source");
+			SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target");
 
 			// Insert initial log row
 			using (var logCmd = new SqlCommand(@"
@@ -135,7 +135,7 @@ public static class IncrementalTableSyncById
 			try
 			{
 				using var targetConn = new SqlConnection(targetConnStr);
-				targetConn.Open();
+				SqlConnectionRetry.OpenWithRetry(targetConn, tableLogger, "target log");
 
 				using var updateCmd = new SqlCommand(@"
 					UPDATE bronze.tbl_dw_copy_logs
@@ -160,5 +160,5 @@ public static class IncrementalTableSyncById
 			}
 		}
 	}
-}
 
+}
